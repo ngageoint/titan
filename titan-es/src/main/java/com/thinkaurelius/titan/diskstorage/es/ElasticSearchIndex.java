@@ -62,6 +62,7 @@ import org.elasticsearch.search.sort.SortOrder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -299,6 +300,7 @@ public class ElasticSearchIndex implements IndexProvider {
             if (config.has(INDEX_CONF_FILE)) {
                 String configFile = config.get(INDEX_CONF_FILE);
                 Settings.Builder sb = Settings.settingsBuilder();
+                sb.put("path.home", System.getProperty("java.io.tmpdir"));
                 log.debug("Configuring ES from YML file [{}]", configFile);
                 FileInputStream fis = null;
                 try {
@@ -333,6 +335,8 @@ public class ElasticSearchIndex implements IndexProvider {
                 builder.clusterName(clustername);
             }
 
+            builder.getSettings().put("index.max_result_window", Integer.MAX_VALUE);
+
             node = builder.client(clientOnly).data(!clientOnly).local(local).node();
             client = node.client();
 
@@ -349,6 +353,7 @@ public class ElasticSearchIndex implements IndexProvider {
             log.debug("Transport sniffing enabled: {}", config.get(CLIENT_SNIFF));
             settings.put("client.transport.sniff", config.get(CLIENT_SNIFF));
             settings.put("script.inline", "on");
+            settings.put("index.max_result_window", Integer.MAX_VALUE);
             TransportClient tc = TransportClient.builder().settings(settings.build()).build();
             int defaultPort = config.has(INDEX_PORT)?config.get(INDEX_PORT):HOST_PORT_DEFAULT;
             for (String host : config.get(INDEX_HOSTS)) {
@@ -482,8 +487,7 @@ public class ElasticSearchIndex implements IndexProvider {
         return AttributeUtil.isString(information.getDataType()) && getStringMapping(information)==Mapping.TEXTSTRING;
     }
 
-    public XContentBuilder getNewDocument(final List<IndexEntry> additions, KeyInformation.StoreRetriever informations, int ttl) throws BackendException {
-        Preconditions.checkArgument(ttl >= 0);
+    public XContentBuilder getNewDocument(final List<IndexEntry> additions, KeyInformation.StoreRetriever informations) throws BackendException {
         try {
             XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
 
@@ -505,19 +509,26 @@ public class ElasticSearchIndex implements IndexProvider {
                         break;
                     case SET:
                     case LIST:
-                        value = add.getValue().stream().map(v -> convertToEsType(v.value)).collect(Collectors.toList()).toArray();
+                        value = add.getValue().stream().map(v -> convertToEsType(v.value))
+                        .filter(v -> {
+                            Preconditions.checkArgument(!(v instanceof byte[]), "Collections not supported for " + add.getKey());
+                            return true;
+                        })
+                        .collect(Collectors.toList()).toArray();
                         break;
                 }
 
-
-                builder.field(add.getKey(), value);
+                if (value instanceof byte[]) {
+                    builder.rawField(add.getKey(), new ByteArrayInputStream((byte[]) value));
+                } else {
+                    builder.field(add.getKey(), value);
+                }
                 if (hasDualStringMapping(informations.get(add.getKey())) && keyInformation.getDataType() == String.class) {
                     builder.field(getDualMappingName(add.getKey()), value);
                 }
 
 
             }
-            if (ttl>0) builder.field(TTL_FIELD, TimeUnit.MILLISECONDS.convert(ttl,TimeUnit.SECONDS));
 
             builder.endObject();
 
@@ -582,12 +593,17 @@ public class ElasticSearchIndex implements IndexProvider {
                         bulkrequests++;
                     }
                     if (mutation.hasAdditions()) {
-                        int ttl = mutation.determineTTL();
+                        long ttl = mutation.determineTTL() * 1000l;
 
                         if (mutation.isNew()) { //Index
                             log.trace("Adding entire document {}", docid);
-                            brb.add(new IndexRequest(indexName, storename, docid)
-                                    .source(getNewDocument(mutation.getAdditions(), informations.get(storename), ttl)));
+                            Preconditions.checkArgument(ttl >= 0);
+                            IndexRequest request = new IndexRequest(indexName, storename, docid)
+                                    .source(getNewDocument(mutation.getAdditions(), informations.get(storename)));
+                            if (ttl > 0) {
+                                request.ttl(ttl);
+                            }
+                            brb.add(request);
 
                         } else {
                             Preconditions.checkArgument(ttl == 0, "Elasticsearch only supports TTL on new documents [%s]", docid);
@@ -597,7 +613,8 @@ public class ElasticSearchIndex implements IndexProvider {
                             UpdateRequestBuilder update = client.prepareUpdate(indexName, storename, docid).setScript(
                                     new Script(script, ScriptService.ScriptType.INLINE, null, null));
                             if (needUpsert) {
-                                XContentBuilder doc = getNewDocument(mutation.getAdditions(), informations.get(storename), ttl);
+                                XContentBuilder doc = getNewDocument(mutation.getAdditions(), informations.get(storename));
+
                                 update.setUpsert(doc);
                             }
 
@@ -689,7 +706,12 @@ public class ElasticSearchIndex implements IndexProvider {
         try {
             XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
 
-            builder.field("value", convertToEsType(value));
+            Object esValue = convertToEsType(value);
+            if (esValue instanceof byte[]) {
+                builder.rawField("value", new ByteArrayInputStream((byte[]) esValue));
+            } else {
+                builder.field("value", esValue);
+            }
 
             String s = builder.string();
             int prefixLength = "{\"value\":".length();
@@ -728,7 +750,13 @@ public class ElasticSearchIndex implements IndexProvider {
                         // Add
                         if (log.isTraceEnabled())
                             log.trace("Adding entire document {}", docID);
-                        bulk.add(new IndexRequest(indexName, store, docID).source(getNewDocument(content, informations.get(store), IndexMutation.determineTTL(content))));
+                        long ttl = IndexMutation.determineTTL(content) * 1000l;
+                        Preconditions.checkArgument(ttl >= 0);
+                        IndexRequest request = new IndexRequest(indexName, store, docID).source(getNewDocument(content, informations.get(store)));
+                        if (ttl > 0) {
+                            request.ttl(ttl);
+                        }
+                        bulk.add(request);
                         requests++;
                     }
                 }

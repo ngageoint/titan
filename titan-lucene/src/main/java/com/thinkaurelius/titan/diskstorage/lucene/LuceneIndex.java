@@ -64,7 +64,7 @@ public class LuceneIndex implements IndexProvider {
     private static final String GEOID = "_____geo";
     private static final int MAX_STRING_FIELD_LEN = 256;
 
-    private static final Version LUCENE_VERSION = Version.LUCENE_5_2_1;
+    private static final Version LUCENE_VERSION = Version.LUCENE_5_5_2;
     private static final IndexFeatures LUCENE_FEATURES = new IndexFeatures.Builder().supportedStringMappings(Mapping.TEXT, Mapping.STRING).supportsCardinality(Cardinality.SINGLE).supportsNanoseconds().build();
 
     private static final int GEO_MAX_LEVELS = 11;
@@ -295,12 +295,16 @@ public class LuceneIndex implements IndexProvider {
 
             if (e.value instanceof Number) {
                 Field field;
+                Field sortField;
                 if (AttributeUtil.isWholeNumber((Number) e.value)) {
                     field = new LongField(e.field, ((Number) e.value).longValue(), Field.Store.YES);
+                    sortField = new NumericDocValuesField(e.field, ((Number) e.value).longValue());
                 } else { //double or float
                     field = new DoubleField(e.field, ((Number) e.value).doubleValue(), Field.Store.YES);
+                    sortField = new DoubleDocValuesField(e.field, ((Number) e.value).doubleValue());
                 }
                 doc.add(field);
+                doc.add(sortField);
             } else if (AttributeUtil.isString(e.value)) {
                 String str = (String) e.value;
                 Mapping mapping = Mapping.getMapping(store, e.field, informations);
@@ -492,7 +496,7 @@ public class LuceneIndex implements IndexProvider {
                 Preconditions.checkArgument(titanPredicate == Geo.WITHIN, "Relation is not supported for geo value: " + titanPredicate);
                 Shape shape = ((Geoshape) value).convert2Spatial4j();
                 SpatialArgs args = new SpatialArgs(SpatialOperation.IsWithin, shape);
-                params.addFilter(getSpatialStrategy(key).makeFilter(args));
+                params.addQuery(getSpatialStrategy(key).makeQuery(args));
             } else if (value instanceof Date) {
                 Preconditions.checkArgument(titanPredicate instanceof Cmp, "Relation not supported on date types: " + titanPredicate);
                 params.addFilter(numericFilter(key, (Cmp) titanPredicate, ((Date) value).getTime()));
